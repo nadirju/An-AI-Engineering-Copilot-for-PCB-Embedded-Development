@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, Optional
 
 from backend.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+_GROQ_DEFAULT_MAX_TOKENS = 8192
+_GROQ_HARD_CAP = 32768
 
 
 class LLMError(RuntimeError):
@@ -104,6 +107,71 @@ def _parse_json_object(raw: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise LLMError("Model JSON output was not an object")
     return data
+
+
+def _close_open_json(text: str) -> str:
+    """Append the closing quote/brackets a truncated JSON document is missing.
+
+    Args:
+        text: Possibly truncated JSON text starting at ``{``.
+
+    Returns:
+        Text with open strings and containers closed.
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    out = text
+    if in_string:
+        out += '"'
+    out = out.rstrip()
+    while out.endswith(","):
+        out = out[:-1].rstrip()
+    return out + "".join(reversed(stack))
+
+
+def _repair_truncated_json(raw: str) -> Optional[dict[str, Any]]:
+    """Best-effort recovery of a JSON object cut off by an output-token limit.
+
+    Closes open strings and containers; if the tail is still unparsable
+    (for example a dangling key), trims back to the previous comma and retries.
+
+    Args:
+        raw: Truncated model output.
+
+    Returns:
+        The recovered dict, or ``None`` if nothing usable could be recovered.
+    """
+    start = raw.find("{")
+    if start == -1:
+        return None
+    text = raw[start:]
+    for _ in range(200):
+        try:
+            data = json.loads(_close_open_json(text))
+        except json.JSONDecodeError:
+            cut = text.rfind(",")
+            if cut <= 0:
+                return None
+            text = text[:cut]
+            continue
+        return data if isinstance(data, dict) else None
+    return None
 
 
 def _strip_unsupported_schema_keys(node: Any) -> Any:
@@ -391,8 +459,42 @@ class GeminiClient(LLMClient):
             raise LLMError(f"Gemini vision failed: {exc}") from exc
 
 
+def _groq_token_floor() -> int:
+    """Minimum output-token budget for Groq calls.
+
+    Reads ``GROQ_MAX_TOKENS`` from the environment (default 8192), clamped to
+    the model's 32768 output limit.
+    """
+    raw = os.environ.get("GROQ_MAX_TOKENS", "").strip()
+    try:
+        value = int(raw) if raw else _GROQ_DEFAULT_MAX_TOKENS
+    except ValueError:
+        logger.warning("Invalid GROQ_MAX_TOKENS=%r; using %d", raw, _GROQ_DEFAULT_MAX_TOKENS)
+        value = _GROQ_DEFAULT_MAX_TOKENS
+    return max(256, min(value, _GROQ_HARD_CAP))
+
+
+def _failed_generation(exc: Exception) -> str:
+    """Extract Groq's ``failed_generation`` text from a 400 error, if present."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error", body)
+        if isinstance(err, dict):
+            value = err.get("failed_generation")
+            if isinstance(value, str):
+                return value
+    return ""
+
+
 class GroqClient(LLMClient):
-    """Groq client (free tier, fast) for text-only completions."""
+    """Groq client (free tier, fast) for text-only completions.
+
+    Reasoning models such as ``openai/gpt-oss-120b`` spend output tokens on
+    hidden reasoning as well as the answer, so the effective ``max_tokens`` is
+    raised to at least ``GROQ_MAX_TOKENS`` (default 8192, hard cap 32768).
+    Structured calls use JSON mode, retry once with a doubled budget if the
+    JSON is rejected, and finally try to repair a truncated payload.
+    """
 
     def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile") -> None:
         if not api_key:
@@ -401,6 +503,26 @@ class GroqClient(LLMClient):
 
         self._client = AsyncGroq(api_key=api_key)
         self._model = model
+        self._floor = _groq_token_floor()
+
+    def _limit(self, requested: int) -> int:
+        """Effective output-token limit for a call."""
+        return min(max(requested, self._floor), _GROQ_HARD_CAP)
+
+    async def _create(
+        self, system: str, prompt: str, max_tokens: int, json_mode: bool
+    ) -> Any:
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        return await self._client.chat.completions.create(**kwargs)
 
     async def complete(
         self,
@@ -409,28 +531,52 @@ class GroqClient(LLMClient):
         schema: Optional[dict[str, Any]] = None,
         max_tokens: int = 2048,
     ) -> str | dict[str, Any]:
-        prompt = user
-        kwargs: dict[str, Any] = {}
-        if schema is not None:
-            prompt = user + _schema_instruction(schema)
-            kwargs["response_format"] = {"type": "json_object"}
+        json_mode = schema is not None
+        prompt = user + _schema_instruction(schema) if schema is not None else user
+        limit = self._limit(max_tokens)
         try:
-            resp = await self._client.chat.completions.create(
-                model=self._model,
-                max_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                **kwargs,
-            )
+            resp = await self._create(system, prompt, limit, json_mode)
         except Exception as exc:  # noqa: BLE001
-            logger.error("Groq call failed: %s", type(exc).__name__)
-            raise LLMError(f"Groq call failed: {exc}") from exc
+            if not (json_mode and "json_validate_failed" in str(exc)):
+                logger.error("Groq call failed: %s", type(exc).__name__)
+                raise LLMError(f"Groq call failed: {exc}") from exc
+            resp = await self._retry_json(system, prompt, limit, exc)
+            if isinstance(resp, dict):
+                return resp
         text = resp.choices[0].message.content or ""
         if schema is not None:
             return _parse_json_object(text)
         return text
+
+    async def _retry_json(
+        self, system: str, prompt: str, limit: int, first: Exception
+    ) -> Any:
+        """Recover from ``json_validate_failed``.
+
+        Retries once with a doubled budget; if that also fails, repairs the
+        truncated ``failed_generation`` of the last error.
+
+        Returns:
+            A chat completion response, or a recovered dict.
+
+        Raises:
+            LLMError: If nothing usable can be recovered.
+        """
+        last: Exception = first
+        bigger = min(limit * 2, _GROQ_HARD_CAP)
+        if bigger > limit:
+            logger.warning("Groq JSON failed at %d tokens; retrying with %d", limit, bigger)
+            try:
+                return await self._create(system, prompt, bigger, True)
+            except Exception as exc:  # noqa: BLE001
+                if "json_validate_failed" not in str(exc):
+                    raise LLMError(f"Groq call failed: {exc}") from exc
+                last = exc
+        recovered = _repair_truncated_json(_failed_generation(last))
+        if recovered:
+            logger.warning("Recovered truncated Groq JSON; output may be incomplete")
+            return recovered
+        raise LLMError(f"Groq returned invalid JSON: {last}") from last
 
     async def stream(
         self, system: str, user: str, max_tokens: int = 2048
@@ -438,7 +584,7 @@ class GroqClient(LLMClient):
         try:
             resp = await self._client.chat.completions.create(
                 model=self._model,
-                max_tokens=max_tokens,
+                max_tokens=self._limit(max_tokens),
                 stream=True,
                 messages=[
                     {"role": "system", "content": system},
@@ -461,7 +607,7 @@ class GroqClient(LLMClient):
         max_tokens: int = 1024,
     ) -> str:
         raise NotImplementedError(
-            "GroqClient does not support image input with llama-3.3-70b-versatile. "
+            "GroqClient does not support image input with the configured Groq model. "
             "Set LLM_PROVIDER to 'gemini', 'anthropic' or 'openai' for Show Me / "
             "screenshot analysis."
         )
@@ -489,7 +635,3 @@ def get_llm_client() -> LLMClient:
     if provider == "groq":
         return GroqClient(s.groq_api_key or "", s.groq_model)
     raise LLMError(f"Unknown LLM_PROVIDER: {s.llm_provider}")
-
-
-# Keep asyncio imported for downstream helpers that may schedule blocking SDK calls.
-_ = asyncio
