@@ -4,7 +4,7 @@ generate -> validate -> (feedback | conclude)."""
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from langgraph.graph import END, StateGraph
 
@@ -28,6 +28,64 @@ from backend.rag.retriever import retrieve
 
 logger = logging.getLogger(__name__)
 
+_TEXT_KEYS: tuple[str, ...] = (
+    "task",
+    "description",
+    "title",
+    "text",
+    "summary",
+    "name",
+    "query",
+    "step",
+    "objective",
+)
+
+
+def _plan_text(item: Any) -> str:
+    """Coerce a planner list item (str, dict, model, other) into text.
+
+    Planner output is not guaranteed to match the declared schema, because
+    some providers do not enforce it. Strings pass through, dicts are searched
+    for a human-readable key, and anything else is stringified.
+
+    Args:
+        item: One element of a planner-produced list.
+
+    Returns:
+        A non-None string (possibly empty).
+    """
+    if item is None:
+        return ""
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        for key in _TEXT_KEYS:
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        parts = [str(v).strip() for v in item.values() if isinstance(v, (str, int, float))]
+        return " - ".join(p for p in parts if p)
+    dump = getattr(item, "model_dump", None)
+    if callable(dump):
+        return _plan_text(dump())
+    return str(item).strip()
+
+
+def _plan_texts(items: Any) -> list[str]:
+    """Coerce a planner list (or a single value) into a list of non-empty strings.
+
+    Args:
+        items: A list of planner items, a single item, or ``None``.
+
+    Returns:
+        Non-empty text for each item.
+    """
+    if items is None:
+        return []
+    if isinstance(items, (str, dict)) or not isinstance(items, Iterable):
+        items = [items]
+    return [t for t in (_plan_text(i) for i in items) if t]
+
 
 def _trace(state: GraphState, node: str, role: Optional[AgentRole], detail: str) -> list[TraceEvent]:
     events = list(state.get("trace", []))
@@ -38,9 +96,11 @@ def _trace(state: GraphState, node: str, role: Optional[AgentRole], detail: str)
 def _ctx(state: GraphState, with_citations: bool = True) -> AgentContext:
     ev = state.get("evidence", [])
     text = "\n".join(f"[{e.name}] {e.text[:1500]}" for e in ev if e.text)
-    notes = []
-    if state.get("plan"):
-        notes.append("Subtasks: " + "; ".join(state["plan"].get("subtasks", [])))
+    notes: list[str] = []
+    plan = state.get("plan") or {}
+    subtasks = _plan_texts(plan.get("subtasks"))
+    if subtasks:
+        notes.append("Subtasks: " + "; ".join(subtasks))
     if state.get("cause"):
         notes.append(f"Prior diagnosis: {state['cause']}")
     return AgentContext(
@@ -82,10 +142,14 @@ def build_graph(llm: LLMClient, max_revisions: int = 2) -> Any:
 
     async def plan(state: GraphState) -> dict[str, Any]:
         p = await planner.plan(_ctx(state, False), state.get("tool", ""))
+        p["subtasks"] = _plan_texts(p.get("subtasks")) or [state["user_msg"]]
+        p["retrieval_queries"] = _plan_texts(p.get("retrieval_queries")) or [state["user_msg"]]
+        for key in ("objective", "domain", "tool", "version", "component"):
+            p[key] = _plan_text(p.get(key))
         return {
             "plan": p,
             "trace": _trace(state, "plan", AgentRole.PLANNER,
-                            f"domain={p.get('domain')} subtasks={len(p.get('subtasks', []))}"),
+                            f"domain={p.get('domain')} subtasks={len(p['subtasks'])}"),
         }
 
     async def route(state: GraphState) -> dict[str, Any]:
@@ -93,12 +157,13 @@ def build_graph(llm: LLMClient, max_revisions: int = 2) -> Any:
 
     async def do_retrieve(state: GraphState) -> dict[str, Any]:
         p = state.get("plan", {})
-        queries = p.get("retrieval_queries") or [state["user_msg"]]
+        queries = _plan_texts(p.get("retrieval_queries")) or [state["user_msg"]]
+        domain = _plan_text(p.get("domain")) or None
         tool = state.get("tool") or None
         seen: dict[str, Any] = {}
         for q in queries[:3]:
             for c in retrieve(q, tool=None if tool in (None, "Unknown") else tool,
-                              version=state.get("version"), domain=p.get("domain"), k=4):
+                              version=state.get("version"), domain=domain, k=4):
                 seen.setdefault(f"{c.component}|{c.section}", c)
         cites = sorted(seen.values(), key=lambda c: c.score, reverse=True)[:6]
         return {
@@ -133,7 +198,8 @@ def build_graph(llm: LLMClient, max_revisions: int = 2) -> Any:
         elif mode == Mode.DEBUG:
             role = AgentRole.DEBUG
             tree, steps, cause, resolved, nxt = await debugger.diagnose(ctx, tool, ver)
-            upd.update(fault_tree=tree, steps=steps, cause=cause, resolved=resolved, next_action=nxt)
+            upd.update(fault_tree=_plan_texts(tree), steps=steps, cause=cause,
+                       resolved=resolved, next_action=nxt)
         elif mode == Mode.SHOW:
             role = AgentRole.TOOL_SPECIALIST
             v = state.get("vision")
@@ -152,9 +218,9 @@ def build_graph(llm: LLMClient, max_revisions: int = 2) -> Any:
                 max_tokens=1800,
             )
             d = rows_data if isinstance(rows_data, dict) else {}
-            upd["translation_rows"] = [(str(r.get("source", "")), str(r.get("target", "")))
+            upd["translation_rows"] = [(_plan_text(r.get("source")), _plan_text(r.get("target")))
                                         for r in d.get("rows", []) if isinstance(r, dict)]
-            upd["answer"] = str(d.get("summary", ""))
+            upd["answer"] = _plan_text(d.get("summary"))
         if state.get("persona") == Persona.BEGINNER and (upd.get("steps") or upd.get("answer")):
             material = upd.get("answer") or "\n".join(s.title + ": " + s.instruction for s in upd["steps"])
             upd["tutor_text"] = await tutor.teach(ctx, material)
