@@ -6,7 +6,7 @@ import logging
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Optional
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -23,14 +23,21 @@ _SECRET_KEYS: tuple[str, ...] = (
     "EMBEDDING_PROVIDER",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GROQ_API_KEY",
     "ANTHROPIC_MODEL",
     "OPENAI_MODEL",
+    "GEMINI_MODEL",
+    "GROQ_MODEL",
     "OPENAI_EMBEDDING_MODEL",
     "CHROMA_MODE",
     "CHROMA_PATH",
     "MAX_REVISIONS",
     "LOG_LEVEL",
 )
+
+LLMProvider = Literal["anthropic", "openai", "gemini", "groq"]
+EmbeddingProvider = Literal["openai", "gemini", "local", "hash"]
 
 
 def _load_streamlit_secrets() -> dict[str, Any]:
@@ -60,12 +67,16 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
 
-    llm_provider: str = Field(default="anthropic")
-    embedding_provider: str = Field(default="openai")
-    anthropic_api_key: str = Field(default="")
-    openai_api_key: str = Field(default="")
+    llm_provider: LLMProvider = Field(default="anthropic")
+    embedding_provider: EmbeddingProvider = Field(default="openai")
+    anthropic_api_key: Optional[str] = Field(default=None)
+    openai_api_key: Optional[str] = Field(default=None)
+    gemini_api_key: Optional[str] = Field(default=None)
+    groq_api_key: Optional[str] = Field(default=None)
     anthropic_model: str = Field(default="claude-sonnet-4-5")
     openai_model: str = Field(default="gpt-4o")
+    gemini_model: str = Field(default="gemini-2.0-flash")
+    groq_model: str = Field(default="llama-3.3-70b-versatile")
     openai_embedding_model: str = Field(default="text-embedding-3-small")
     chroma_mode: str = Field(default="persistent")
     chroma_path: str = Field(default="./data/chroma")
@@ -75,9 +86,13 @@ class Settings(BaseSettings):
     @property
     def has_llm_key(self) -> bool:
         """Whether the key for the selected LLM provider is configured."""
-        if self.llm_provider.lower() == "openai":
-            return bool(self.openai_api_key)
-        return bool(self.anthropic_api_key)
+        keys: dict[str, Optional[str]] = {
+            "anthropic": self.anthropic_api_key,
+            "openai": self.openai_api_key,
+            "gemini": self.gemini_api_key,
+            "groq": self.groq_api_key,
+        }
+        return bool(keys.get(self.llm_provider))
 
 
 def _overlay_secrets() -> None:
